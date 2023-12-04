@@ -150,6 +150,207 @@ impl<USB: UsbPeripheral> UsbBus<USB> {
         Ok(())
     }
 
+    pub fn reset(&self) {
+        critical_section::with(|cs| {
+            let regs = self.regs.borrow(cs);
+
+            self.configure_all(cs);
+
+            modify_reg!(otg_device, regs.device(), DCFG, DAD: 0);
+        });
+    }
+
+    pub fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
+        if ep_addr.index() >= USB::ENDPOINT_COUNT {
+            return;
+        }
+
+        let regs = UsbRegisters::new::<USB>();
+        crate::endpoint::set_stalled(regs, ep_addr, stalled)
+    }
+
+    pub fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
+        if ep_addr.index() >= USB::ENDPOINT_COUNT {
+            return true;
+        }
+
+        let regs = UsbRegisters::new::<USB>();
+        crate::endpoint::is_stalled(regs, ep_addr)
+    }
+
+    pub fn set_device_address(&self, addr: u8) {
+        critical_section::with(|cs| {
+            let regs = self.regs.borrow(cs);
+
+            modify_reg!(otg_device, regs.device(), DCFG, DAD: addr as u32);
+        });
+    }
+
+    pub fn alloc_ep(
+        &mut self,
+        ep_dir: UsbDirection,
+        ep_addr: Option<EndpointAddress>,
+        ep_type: EndpointType,
+        max_packet_size: u16,
+        interval: u8,
+    ) -> Result<EndpointAddress> {
+        self.allocator
+            .alloc_ep(ep_dir, ep_addr, ep_type, max_packet_size, interval)
+    }
+
+    pub fn enable(&mut self) {
+        // Enable USB_OTG in RCC
+        USB::enable();
+
+        critical_section::with(|cs| {
+            let regs = self.regs.borrow(cs);
+
+            let core_id = read_reg!(otg_global, regs.global(), CID);
+
+            // Wait for AHB ready
+            while read_reg!(otg_global, regs.global(), GRSTCTL, AHBIDL) == 0 {}
+
+            // Configure OTG as device
+            #[cfg(feature = "fs")]
+            modify_reg!(otg_global, regs.global(), GUSBCFG,
+                SRPCAP: 0, // SRP capability is not enabled
+                FDMOD: 1 // Force device mode
+            );
+            #[cfg(feature = "hs")]
+            modify_reg!(otg_global, regs.global(), GUSBCFG,
+                SRPCAP: 0, // SRP capability is not enabled
+                TOCAL: 0x1,
+                FDMOD: 1 // Force device mode
+            );
+
+            // Configure USB PHY
+            #[cfg(feature = "hs")]
+            match self.peripheral.phy_type() {
+                PhyType::InternalFullSpeed => {
+                    // Select FS Embedded PHY
+                    modify_reg!(otg_global, regs.global(), GUSBCFG, PHYSEL: 1);
+                }
+                PhyType::InternalHighSpeed => {
+                    // Turn off PHY
+                    modify_reg!(otg_global, regs.global(), GCCFG, PWRDWN: 0);
+
+                    // Init The UTMI Interface
+                    modify_reg!(otg_global, regs.global(), GUSBCFG,
+                        TSDPS: 0,
+                        ULPIFSLS: 0,
+                        PHYSEL: 0 // ULPI or UTMI
+                    );
+
+                    // Select VBUS source
+                    modify_reg!(otg_global, regs.global(), GUSBCFG,
+                        ULPIEVBUSD: 0,
+                        ULPIEVBUSI: 0
+                    );
+
+                    // Select UTMI Interace
+                    //modify_reg!(otg_global, regs.global(), GUSBCFG, ULPISEL: 0);
+                    modify_reg!(otg_global, regs.global(), GUSBCFG, |r| r & !(1 << 4));
+
+                    // This is a secret bit from ST that is not mentioned anywhere except
+                    // the driver code shipped with STM32CubeIDE.
+                    //modify_reg!(otg_global, regs.global(), GCCFG, PHYHSEN: 1);
+                    modify_reg!(otg_global, regs.global(), GCCFG, |r| r | (1 << 23));
+
+                    self.peripheral.setup_internal_hs_phy();
+                }
+                PhyType::ExternalHighSpeed => {
+                    // Turn off embedded PHY
+                    modify_reg!(otg_global, regs.global(), GCCFG, PWRDWN: 0);
+
+                    // Init The ULPI Interface
+                    modify_reg!(otg_global, regs.global(), GUSBCFG,
+                        TSDPS: 0,
+                        ULPIFSLS: 0,
+                        PHYSEL: 0 // ULPI or UTMI
+                    );
+
+                    // Select VBUS source
+                    modify_reg!(otg_global, regs.global(), GUSBCFG,
+                        ULPIEVBUSD: 0,
+                        ULPIEVBUSI: 0
+                    );
+                }
+            }
+
+            // Perform core soft-reset
+            while read_reg!(otg_global, regs.global(), GRSTCTL, AHBIDL) == 0 {}
+            modify_reg!(otg_global, regs.global(), GRSTCTL, CSRST: 1);
+            while read_reg!(otg_global, regs.global(), GRSTCTL, CSRST) == 1 {}
+
+            if self.peripheral.phy_type() == PhyType::InternalFullSpeed {
+                // Activate the USB Transceiver
+                modify_reg!(otg_global, regs.global(), GCCFG, PWRDWN: 1);
+            }
+
+            // Configuring Vbus sense and SOF output
+            match core_id {
+                0x0000_1200 | 0x0000_1100 => {
+                    // F429-like chips have the GCCFG.NOVBUSSENS bit
+
+                    //modify_reg!(otg_global, regs.global, GCCFG, NOVBUSSENS: 1);
+                    modify_reg!(otg_global, regs.global(), GCCFG, |r| r | (1 << 21));
+
+                    modify_reg!(otg_global, regs.global(), GCCFG, VBUSASEN: 0, VBUSBSEN: 0, SOFOUTEN: 0);
+                }
+                0x0000_2000 | 0x0000_2100 | 0x0000_2300 | 0x0000_3000 | 0x0000_3100 => {
+                    // F446-like chips have the GCCFG.VBDEN bit with the opposite meaning
+
+                    //modify_reg!(otg_global, regs.global, GCCFG, VBDEN: 0);
+                    modify_reg!(otg_global, regs.global(), GCCFG, |r| r & !(1 << 21));
+
+                    // Force B-peripheral session
+                    //modify_reg!(otg_global, regs.global, GOTGCTL, BVALOEN: 1, BVALOVAL: 1);
+                    modify_reg!(otg_global, regs.global(), GOTGCTL, |r| r | (0b11 << 6));
+                }
+                _ => {}
+            }
+
+            // Enable PHY clock
+            write_reg!(otg_pwrclk, regs.pwrclk(), PCGCCTL, 0);
+
+            // Soft disconnect device
+            modify_reg!(otg_device, regs.device(), DCTL, SDIS: 1);
+
+            // Setup USB speed and frame interval
+            let speed = match (USB::HIGH_SPEED, self.peripheral.phy_type()) {
+                (false, _) => 0b11,
+                (true, PhyType::InternalFullSpeed) => 0b11,
+                (true, PhyType::InternalHighSpeed) => 0b00,
+                (true, PhyType::ExternalHighSpeed) => 0b00,
+            };
+            modify_reg!(otg_device, regs.device(), DCFG,
+                PFIVL: 0b00,
+                DSPD: speed
+            );
+            #[cfg(feature = "xcvrdly")]
+            modify_reg!(otg_device, regs.device(), DCFG, XCVRDLY: 1);
+
+            // unmask EP interrupts
+            write_reg!(otg_device, regs.device(), DIEPMSK, XFRCM: 1);
+
+            // unmask core interrupts
+            write_reg!(otg_global, regs.global(), GINTMSK,
+                USBRST: 1, ENUMDNEM: 1,
+                USBSUSPM: 1, WUIM: 1,
+                IEPINT: 1, RXFLVLM: 1
+            );
+
+            // clear pending interrupts
+            write_reg!(otg_global, regs.global(), GINTSTS, 0xffffffff);
+
+            // unmask global interrupt
+            modify_reg!(otg_global, regs.global(), GAHBCFG, GINT: 1);
+
+            // connect(true)
+            modify_reg!(otg_device, regs.device(), DCTL, SDIS: 0);
+        });
+    }
+
     #[cfg(feature = "hs")]
     /// Reads from a ULPI register in an external ULPI PHY.
     ///
@@ -303,7 +504,7 @@ impl<USB: UsbPeripheral> EndpointAllocator<USB> {
         })
     }
 
-    fn alloc_in(&mut self, config: &EndpointConfig) -> Result<EndpointIn> {
+    pub fn alloc_in(&mut self, config: &EndpointConfig) -> Result<EndpointIn> {
         let descr = Self::alloc(&mut self.bitmap_in, config, UsbDirection::In)?;
 
         self.memory_allocator
@@ -313,7 +514,7 @@ impl<USB: UsbPeripheral> EndpointAllocator<USB> {
         Ok(ep)
     }
 
-    fn alloc_out(&mut self, config: &EndpointConfig) -> Result<EndpointOut> {
+    pub fn alloc_out(&mut self, config: &EndpointConfig) -> Result<EndpointOut> {
         let descr = Self::alloc(&mut self.bitmap_out, config, UsbDirection::Out)?;
 
         let buffer = self

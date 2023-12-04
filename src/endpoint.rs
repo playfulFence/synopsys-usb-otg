@@ -38,8 +38,8 @@ pub fn is_stalled(usb: UsbRegisters, address: EndpointAddress) -> bool {
 
 /// Arbitrates access to the endpoint-specific registers and packet buffer memory.
 pub struct Endpoint {
-    descriptor: EndpointDescriptor,
-    usb: UsbRegisters,
+    pub descriptor: EndpointDescriptor,
+    pub usb: UsbRegisters,
 }
 
 impl Endpoint {
@@ -55,13 +55,13 @@ impl Endpoint {
     }
 
     #[inline(always)]
-    fn index(&self) -> u8 {
+    pub fn index(&self) -> u8 {
         self.descriptor.address.index() as u8
     }
 }
 
 pub struct EndpointIn {
-    common: Endpoint,
+    pub common: Endpoint,
 }
 
 impl EndpointIn {
@@ -148,8 +148,8 @@ impl EndpointIn {
 }
 
 pub struct EndpointOut {
-    common: Endpoint,
-    pub(crate) buffer: Mutex<RefCell<EndpointBuffer>>,
+    pub common: Endpoint,
+    pub buffer: Mutex<RefCell<EndpointBuffer>>,
 }
 
 impl EndpointOut {

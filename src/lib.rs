@@ -8,18 +8,18 @@ compile_error!("choose only one USB mode");
 #[cfg(not(any(feature = "fs", feature = "hs")))]
 compile_error!("select USB mode feature (fs/hs)");
 
-mod endpoint;
-mod endpoint_memory;
+pub mod endpoint;
+pub mod endpoint_memory;
 
-mod target;
+pub mod target;
 
 /// USB peripheral driver.
 pub mod bus;
 
 pub use crate::bus::UsbBus;
 
-mod ral;
-mod transition;
+pub mod ral;
+pub mod transition;
 
 /// A trait for device-specific USB peripherals. Implement this to add support for a new hardware
 /// platform. Peripherals that have this trait must have the same register block as STM32 USB OTG

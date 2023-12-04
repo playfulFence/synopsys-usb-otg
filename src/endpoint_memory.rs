@@ -14,9 +14,9 @@ pub enum EndpointBufferState {
 }
 
 pub struct EndpointBuffer {
-    buffer: &'static mut [VolatileCell<u32>],
-    data_size: u16,
-    has_data: bool,
+    pub buffer: &'static mut [VolatileCell<u32>],
+    pub data_size: u16,
+    pub has_data: bool,
     is_setup: bool,
 }
 
